@@ -25,6 +25,12 @@ from collections import deque
 from device_config import DeviceConfig, validate_config
 from unit_utils import zu_mbar, mbar_zu_anzeige
 
+
+def ts_print(*args, **kwargs):
+    """Print mit Zeitstempel-Prefix für alle Konsolenausgaben."""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}]", *args, **kwargs)
+
 try:
     from colorama import init as colorama_init
     from pyfiglet import figlet_format
@@ -86,7 +92,8 @@ HOST        = "192.168.1.71"
 PORT        = 8000
 TIMEOUT     = 3
 CHANNELS    = [4, 5, 6]
-MAX_PUNKTE  = 3600
+MAX_PUNKTE  = 3600  # Legacy-Default, wird von MainWindow dynamisch überschrieben
+PUNKTE_PRO_TAG = 86400  # 1 Datenpunkt/Sekunde × 24h
 
 KANAL_FARBEN = {
     4: "#00C8FF",
@@ -137,6 +144,7 @@ CONFIG_DEFAULTS = {
     "auto_start": False,
     "theme":      "dark",
     "anzeige_einheit": "mbar",
+    "plot_tage": 1,
     "alarm": {
         "4": {"aktiv": False, "grenze": 1000.0},
         "5": {"aktiv": False, "grenze": 1000.0},
@@ -162,10 +170,17 @@ def config_laden() -> dict:
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, encoding="utf-8") as f:
-                gespeichert = _json.load(f)
+                inhalt = f.read()
+            if not inhalt.strip():
+                ts_print(f"Config-Datei leer, verwende Defaults: {CONFIG_FILE}")
+                return cfg
+            gespeichert = _json.loads(inhalt)
+            if not isinstance(gespeichert, dict):
+                ts_print(f"Config-Datei enthält kein Dict, verwende Defaults: {CONFIG_FILE}")
+                return cfg
             cfg = _deep_merge(cfg, gespeichert)
         except Exception as e:
-            print(f"Config-Ladefehler ({CONFIG_FILE}): {e}")
+            ts_print(f"Config-Ladefehler ({CONFIG_FILE}): {e}")
     return cfg
 
 
@@ -175,7 +190,7 @@ def config_speichern(cfg: dict):
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             _json.dump(cfg, f, indent=2, ensure_ascii=False)
     except Exception as e:
-        print(f"Config-Schreibfehler: {e}")
+        ts_print(f"Config-Schreibfehler: {e}")
 
 
 # ── UI-Strings (für spätere Mehrsprachigkeit hier zentral ändern) ─────────────
@@ -201,7 +216,7 @@ S = {
     "lbl_messung_stop": "Sensor einschalten",
     "tt_start":       "Messung starten / stoppen\nVerbindet mit TPG 366 und beginnt Druckerfassung",
     "tt_intervall":   "Messintervall in Sekunden\n(0,5 s – 300 s)\nÄnderungen wirken sofort",
-    "tt_fenster":     "Zeitfenster: nur letzte N Minuten anzeigen\n0 = alle Daten seit Messstart",
+    "tt_fenster":     "Zeitfenster: nur letzte N Minuten anzeigen\n0 = automatisch (begrenzt durch Tage-Spinner)",
     "tt_yscale":      "Y-Achse: zwischen logarithmischer und linearer Skalierung umschalten",
     "tt_logging":     "CSV-Logging starten / stoppen\nDateiname: YYYY-MM-DD.csv im gewählten Ordner",
     "tt_ordner":      "Speicherordner für CSV-Dateien\nWird automatisch gespeichert",
@@ -773,7 +788,7 @@ class VergleichsDatei:
                         continue
                 self._daten[ch] = (ts_list, p_list)
         except Exception as e:
-            print(f"Ladefehler {self.pfad}: {e}")
+            ts_print(f"Ladefehler {self.pfad}: {e}")
 
     def _draw(self):
         self._remove()
@@ -1219,9 +1234,16 @@ class MainWindow(QMainWindow):
         )
         self._adaptiv_mess_iv = self._cfg.get("adaptiv_mess_iv", 1.0)
 
+        # Plot-Sichtfenster: Tage (1–7), begrenzt RAM-Verbrauch
+        try:
+            self._plot_tage = max(1, min(7, int(self._cfg.get("plot_tage", 1))))
+        except (ValueError, TypeError):
+            self._plot_tage = 1
+        max_punkte = self._plot_tage * PUNKTE_PRO_TAG
+
         # Datenpuffer: matplotlib date numbers (float)
-        self.ts_puffer  = deque(maxlen=MAX_PUNKTE)
-        self.wertpuffer = {ch: deque(maxlen=MAX_PUNKTE) for ch in CHANNELS}
+        self.ts_puffer  = deque(maxlen=max_punkte)
+        self.wertpuffer = {ch: deque(maxlen=max_punkte) for ch in CHANNELS}
 
         self.settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
 
@@ -1557,6 +1579,18 @@ class MainWindow(QMainWindow):
         z1.addSpacing(8)
         z1.addWidget(QLabel("Fenster:"))
         z1.addWidget(self.spin_zeitfenster)
+        z1.addSpacing(4)
+        self.spin_plot_tage = QSpinBox()
+        self.spin_plot_tage.setRange(1, 7)
+        self.spin_plot_tage.setValue(self._plot_tage)
+        self.spin_plot_tage.setSuffix(" d")
+        self.spin_plot_tage.setFixedWidth(55)
+        self.spin_plot_tage.setToolTip(
+            "Max. sichtbare Tage im Plot (1–7)\n"
+            "Begrenzt auch den RAM-Verbrauch bei Langzeitmessungen"
+        )
+        self.spin_plot_tage.valueChanged.connect(self._on_plot_tage_changed)
+        z1.addWidget(self.spin_plot_tage)
         z1.addSpacing(8)
         z1.addWidget(QLabel("Plot-Stil:"))
         z1.addWidget(self.cmb_style)
@@ -1977,6 +2011,10 @@ class MainWindow(QMainWindow):
         if idx >= 0:
             self.cmb_einheit.setCurrentIndex(idx)
 
+        # Plot-Tage
+        if hasattr(self, 'spin_plot_tage'):
+            self.spin_plot_tage.setValue(self._plot_tage)
+
         # Theme-Button-Label aktualisieren
         self.btn_theme.setText(
             "☀ Hell" if self._theme_name == "dark" else "🌙 Dunkel"
@@ -2002,6 +2040,7 @@ class MainWindow(QMainWindow):
             "auto_start":         self.chk_autostart.isChecked(),
             "theme":              self._theme_name,
             "anzeige_einheit":    self.cmb_einheit.currentText(),
+            "plot_tage":          self._plot_tage,
             "adaptiv_schwelle":   self._adaptiv_filter.schwelle_pct,
             "adaptiv_wartezeit":  self._adaptiv_filter.max_wartezeit,
             "adaptiv_mess_iv":    self._adaptiv_mess_iv,
@@ -2023,6 +2062,17 @@ class MainWindow(QMainWindow):
     def _mbar_zu_anzeige(self, wert_mbar):
         """Rechnet einen mbar-Wert in die gewählte Anzeigeeinheit um."""
         return mbar_zu_anzeige(wert_mbar, self.anzeige_einheit)
+
+    def _on_plot_tage_changed(self, tage: int):
+        self._plot_tage = tage
+        max_punkte = tage * PUNKTE_PRO_TAG
+        # Deques mit neuer Maximalgröße erzeugen, alte Daten übernehmen
+        old_ts = list(self.ts_puffer)
+        self.ts_puffer = deque(old_ts, maxlen=max_punkte)
+        for ch in CHANNELS:
+            old_w = list(self.wertpuffer[ch])
+            self.wertpuffer[ch] = deque(old_w, maxlen=max_punkte)
+        self._log(f"Plot-Sichtfenster geändert: {tage} Tag(e)")
 
     def _on_interval_changed(self, v: float):
         self._log(f"Messintervall geändert: {v} s")
@@ -2267,15 +2317,23 @@ class MainWindow(QMainWindow):
         ts_arr      = list(self.ts_puffer)
         fenster_min = self.spin_zeitfenster.value()
 
+        # ── Sichtfenster berechnen ────────────────────────────────────────
+        # Priorität: Minuten-Spinner > 0 → verwende Minuten.
+        # Sonst: verwende plot_tage (Tages-Spinner).
         if fenster_min > 0 and ts_arr:
             grenze    = ts_arr[-1] - fenster_min * 60.0 / 86400.0
+            idx_start = next((i for i, t in enumerate(ts_arr) if t >= grenze), 0)
+            ts_plot   = ts_arr[idx_start:]
+        elif ts_arr:
+            # Tagesfenster: maximal _plot_tage Tage ab jetzt zurückschauend,
+            # aber nicht starr 00:00–24:00, sondern gleitend ab neuestem Wert.
+            grenze = ts_arr[-1] - self._plot_tage  # plot_tage in Tagen, ts in mpl-days
             idx_start = next((i for i, t in enumerate(ts_arr) if t >= grenze), 0)
             ts_plot   = ts_arr[idx_start:]
         else:
             ts_plot   = ts_arr
             idx_start = 0
 
-        stats_zeilen = []  # nicht mehr für Plot-Text verwendet, bleibt für Debugging
         for ch in CHANNELS:
             w_arr   = list(self.wertpuffer[ch])
             w_plot  = w_arr[idx_start:]

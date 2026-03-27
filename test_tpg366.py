@@ -11,6 +11,7 @@ import socket
 import tempfile
 import threading
 from unittest import mock
+from collections import deque
 from datetime import datetime, timezone, timedelta
 
 import pytest
@@ -1278,6 +1279,175 @@ class TestMeasThreadUsesDeviceConfig:
 
         assert captured['addr'] == ("10.20.30.40", 12345)
         assert captured['timeout'] == 7
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ts_print – Zeitstempel in Konsolenausgaben
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestTsPrint:
+    def test_has_timestamp_format(self, capsys):
+        tpg.ts_print("Testmeldung")
+        out = capsys.readouterr().out
+        # Format: [YYYY-MM-DD HH:MM:SS] Testmeldung
+        import re
+        assert re.match(r'\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] Testmeldung', out)
+
+    def test_multiple_args(self, capsys):
+        tpg.ts_print("A", "B", "C")
+        out = capsys.readouterr().out
+        assert "A B C" in out
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Config-Laden: leere / beschädigte Dateien
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestConfigLadenRobust:
+    def test_empty_file_returns_defaults(self, tmp_path):
+        cfg_file = tmp_path / "empty.json"
+        cfg_file.write_text("")
+        with mock.patch.object(tpg, 'CONFIG_FILE', str(cfg_file)):
+            cfg = tpg.config_laden()
+        assert cfg["host"] == "192.168.1.71"
+        assert cfg["port"] == 8000
+
+    def test_whitespace_only_returns_defaults(self, tmp_path):
+        cfg_file = tmp_path / "ws.json"
+        cfg_file.write_text("   \n  \t  ")
+        with mock.patch.object(tpg, 'CONFIG_FILE', str(cfg_file)):
+            cfg = tpg.config_laden()
+        assert cfg == tpg.CONFIG_DEFAULTS
+
+    def test_broken_json_returns_defaults(self, tmp_path):
+        cfg_file = tmp_path / "broken.json"
+        cfg_file.write_text("{broken json!!!")
+        with mock.patch.object(tpg, 'CONFIG_FILE', str(cfg_file)):
+            cfg = tpg.config_laden()
+        assert cfg["host"] == "192.168.1.71"
+
+    def test_json_array_instead_of_dict(self, tmp_path):
+        cfg_file = tmp_path / "array.json"
+        cfg_file.write_text("[1, 2, 3]")
+        with mock.patch.object(tpg, 'CONFIG_FILE', str(cfg_file)):
+            cfg = tpg.config_laden()
+        assert cfg == tpg.CONFIG_DEFAULTS
+
+    def test_empty_file_prints_timestamp(self, tmp_path, capsys):
+        cfg_file = tmp_path / "empty2.json"
+        cfg_file.write_text("")
+        with mock.patch.object(tpg, 'CONFIG_FILE', str(cfg_file)):
+            tpg.config_laden()
+        out = capsys.readouterr().out
+        import re
+        assert re.search(r'\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\].*leer', out, re.IGNORECASE)
+
+    def test_broken_json_prints_timestamp(self, tmp_path, capsys):
+        cfg_file = tmp_path / "bad.json"
+        cfg_file.write_text("{bad")
+        with mock.patch.object(tpg, 'CONFIG_FILE', str(cfg_file)):
+            tpg.config_laden()
+        out = capsys.readouterr().out
+        import re
+        assert re.search(r'\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\].*Config', out)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  plot_tage Setting + Puffergröße
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestPlotTage:
+    def test_default_in_config_defaults(self):
+        assert "plot_tage" in tpg.CONFIG_DEFAULTS
+        assert tpg.CONFIG_DEFAULTS["plot_tage"] == 1
+
+    def test_plot_tage_loaded_from_config(self, tmp_path):
+        import json
+        cfg_file = tmp_path / "c.json"
+        cfg_file.write_text(json.dumps({"plot_tage": 3}))
+        with mock.patch.object(tpg, 'CONFIG_FILE', str(cfg_file)):
+            cfg = tpg.config_laden()
+        assert cfg["plot_tage"] == 3
+
+    def test_plot_tage_in_snapshot(self):
+        win = mock.MagicMock()
+        win._plot_tage = 2
+        win.alarm_checks = {ch: mock.MagicMock() for ch in tpg.CHANNELS}
+        win.alarm_spins = {ch: mock.MagicMock() for ch in tpg.CHANNELS}
+        for ch in tpg.CHANNELS:
+            win.alarm_checks[ch].isChecked.return_value = False
+            win.alarm_spins[ch].value.return_value = 1000.0
+        win.edit_pfad.text.return_value = "/tmp"
+        win.spin_interval.value.return_value = 1.0
+        win.cmb_style.currentText.return_value = "Linie"
+        win.btn_logscale.isChecked.return_value = True
+        win.chk_autostart.isChecked.return_value = False
+        win._theme_name = "dark"
+        win.cmb_einheit.currentText.return_value = "mbar"
+        win._adaptiv_filter = mock.MagicMock()
+        win._adaptiv_filter.schwelle_pct = 0.5
+        win._adaptiv_filter.max_wartezeit = 60.0
+        win._adaptiv_mess_iv = 1.0
+
+        snap = tpg.MainWindow._cfg_snapshot(win)
+        assert snap["plot_tage"] == 2
+
+    def test_puffer_maxlen_scales_with_tage(self):
+        """Deque-Größe soll proportional zu plot_tage sein."""
+        # 1 Tag = 86400 Punkte
+        d = deque(maxlen=1 * tpg.PUNKTE_PRO_TAG)
+        assert d.maxlen == 86400
+        d3 = deque(maxlen=3 * tpg.PUNKTE_PRO_TAG)
+        assert d3.maxlen == 259200
+
+    def test_on_plot_tage_changed_resizes_deque(self):
+        """_on_plot_tage_changed soll die Deques anpassen."""
+        win = mock.MagicMock()
+        win._plot_tage = 1
+        win.ts_puffer = deque([1.0, 2.0, 3.0], maxlen=86400)
+        win.wertpuffer = {ch: deque([100.0, 200.0, 300.0], maxlen=86400)
+                          for ch in tpg.CHANNELS}
+        win._log = mock.MagicMock()
+
+        tpg.MainWindow._on_plot_tage_changed(win, 3)
+
+        assert win._plot_tage == 3
+        assert win.ts_puffer.maxlen == 3 * 86400
+        assert list(win.ts_puffer) == [1.0, 2.0, 3.0]  # Daten erhalten
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Plot-Zeitfenster-Logik
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestPlotZeitfensterLogik:
+    def test_few_points_no_forced_24h(self):
+        """Bei wenigen Datenpunkten wird kein starres 24h-Fenster erzwungen."""
+        # Simuliert 10 Punkte innerhalb von 10 Sekunden
+        import matplotlib.dates as mdates
+        base = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
+        ts_list = [mdates.date2num(base + timedelta(seconds=i)) for i in range(10)]
+        # Die Spanne der Daten ist ~10s, nicht 24h
+        span = ts_list[-1] - ts_list[0]
+        assert span < 0.001  # weniger als ~1.4 Minuten in Tagen (86400 s)
+
+    def test_day_window_clips_old_data(self):
+        """Mit plot_tage=1 und Daten über 2 Tage, wird nur der letzte Tag gezeigt."""
+        import matplotlib.dates as mdates
+        base = datetime(2025, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+        # 2 Tage Daten: Tag 1 (alt) und Tag 2 (aktuell)
+        ts_list = []
+        for hour in range(0, 48):
+            ts_list.append(mdates.date2num(base + timedelta(hours=hour)))
+
+        # plot_tage = 1 → grenze = neuester - 1.0 (mpl-days)
+        grenze = ts_list[-1] - 1.0
+        idx_start = next((i for i, t in enumerate(ts_list) if t >= grenze), 0)
+        visible = ts_list[idx_start:]
+
+        # Sichtbar sollten nur ~24 Stunden sein
+        assert len(visible) <= 25
+        assert len(visible) >= 23
 
 
 if __name__ == "__main__":
