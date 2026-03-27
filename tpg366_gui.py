@@ -216,7 +216,7 @@ S = {
     "lbl_messung_stop": "Sensor einschalten",
     "tt_start":       "Messung starten / stoppen\nVerbindet mit TPG 366 und beginnt Druckerfassung",
     "tt_intervall":   "Messintervall in Sekunden\n(0,5 s – 300 s)\nÄnderungen wirken sofort",
-    "tt_fenster":     "Zeitfenster: nur letzte N Minuten anzeigen\n0 = automatisch (begrenzt durch Tage-Spinner)",
+    "tt_fenster":     "Zeitfenster: nur letzte N Minuten anzeigen\n0 = alle gepufferten Daten (max. durch Plot-Tage begrenzt)",
     "tt_yscale":      "Y-Achse: zwischen logarithmischer und linearer Skalierung umschalten",
     "tt_logging":     "CSV-Logging starten / stoppen\nDateiname: YYYY-MM-DD.csv im gewählten Ordner",
     "tt_ordner":      "Speicherordner für CSV-Dateien\nWird automatisch gespeichert",
@@ -1579,18 +1579,6 @@ class MainWindow(QMainWindow):
         z1.addSpacing(8)
         z1.addWidget(QLabel("Fenster:"))
         z1.addWidget(self.spin_zeitfenster)
-        z1.addSpacing(4)
-        self.spin_plot_tage = QSpinBox()
-        self.spin_plot_tage.setRange(1, 7)
-        self.spin_plot_tage.setValue(self._plot_tage)
-        self.spin_plot_tage.setSuffix(" d")
-        self.spin_plot_tage.setFixedWidth(55)
-        self.spin_plot_tage.setToolTip(
-            "Max. sichtbare Tage im Plot (1–7)\n"
-            "Begrenzt auch den RAM-Verbrauch bei Langzeitmessungen"
-        )
-        self.spin_plot_tage.valueChanged.connect(self._on_plot_tage_changed)
-        z1.addWidget(self.spin_plot_tage)
         z1.addSpacing(8)
         z1.addWidget(QLabel("Plot-Stil:"))
         z1.addWidget(self.cmb_style)
@@ -1653,6 +1641,23 @@ class MainWindow(QMainWindow):
         z2.addSpacing(8)
         z2.addWidget(self.btn_vgl_fenster)
         z2.addWidget(btn_pdf)
+        z2.addSpacing(8)
+        lbl_tage = QLabel("Plot-Tage:")
+        lbl_tage.setToolTip(
+            "Maximale sichtbare Tage im Plot (1–7)\n"
+            "Begrenzt auch den RAM-Verbrauch bei Langzeitmessungen.\n"
+            "Wirkt wenn der Minuten-Spinner auf 'Alle' steht."
+        )
+        z2.addWidget(lbl_tage)
+        self.spin_plot_tage = QSpinBox()
+        self.spin_plot_tage.setRange(1, 7)
+        self.spin_plot_tage.setValue(self._plot_tage)
+        self.spin_plot_tage.setSuffix(" d")
+        self.spin_plot_tage.setFixedWidth(60)
+        self.spin_plot_tage.setToolTip(lbl_tage.toolTip())
+        self.spin_plot_tage.valueChanged.connect(self._on_plot_tage_changed)
+        z2.addWidget(self.spin_plot_tage)
+        z2.addSpacing(8)
         z2.addWidget(self.btn_theme)
         z2.addWidget(self.chk_autostart)
         z2.addWidget(btn_about)
@@ -2318,16 +2323,12 @@ class MainWindow(QMainWindow):
         fenster_min = self.spin_zeitfenster.value()
 
         # ── Sichtfenster berechnen ────────────────────────────────────────
-        # Priorität: Minuten-Spinner > 0 → verwende Minuten.
-        # Sonst: verwende plot_tage (Tages-Spinner).
+        # Minuten-Spinner > 0 → verwende Minuten-Fenster.
+        # Minuten-Spinner == 0 ("Alle") → zeige alles im Deque-Puffer.
+        # Der Deque-Puffer selbst ist durch plot_tage × 86400 begrenzt,
+        # d.h. RAM wächst nie über die eingestellten Tage hinaus.
         if fenster_min > 0 and ts_arr:
             grenze    = ts_arr[-1] - fenster_min * 60.0 / 86400.0
-            idx_start = next((i for i, t in enumerate(ts_arr) if t >= grenze), 0)
-            ts_plot   = ts_arr[idx_start:]
-        elif ts_arr:
-            # Tagesfenster: maximal _plot_tage Tage ab jetzt zurückschauend,
-            # aber nicht starr 00:00–24:00, sondern gleitend ab neuestem Wert.
-            grenze = ts_arr[-1] - self._plot_tage  # plot_tage in Tagen, ts in mpl-days
             idx_start = next((i for i, t in enumerate(ts_arr) if t >= grenze), 0)
             ts_plot   = ts_arr[idx_start:]
         else:

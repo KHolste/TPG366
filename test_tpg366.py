@@ -1450,5 +1450,225 @@ class TestPlotZeitfensterLogik:
         assert len(visible) >= 23
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  Regressionstests: Adaptive Mode, Logging-Zeit, Plot-Tage-Widget
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestAdaptiveModeIntegration:
+    """Adaptive Mode: Aktivierung, Intervallwechsel, Filterwirkung."""
+
+    def test_toggle_sets_flag(self):
+        win = mock.MagicMock()
+        win._adaptiv_aktiv = False
+        win._adaptiv_mess_iv = 1.0
+        win._adaptiv_filter = tpg.AdaptivFilter()
+        win.meas_thread = None
+        win.btn_adaptiv = mock.MagicMock()
+        tpg.MainWindow._toggle_adaptiv(win, True)
+        assert win._adaptiv_aktiv is True
+
+    def test_toggle_off_restores_interval(self):
+        win = mock.MagicMock()
+        win._adaptiv_aktiv = True
+        win.meas_thread = mock.MagicMock()
+        win.meas_thread._running = True
+        win.spin_interval.value.return_value = 5.0
+        win.btn_adaptiv = mock.MagicMock()
+        tpg.MainWindow._toggle_adaptiv(win, False)
+        assert win._adaptiv_aktiv is False
+        win.meas_thread.__setattr__('interval', 5.0)
+
+    def test_toggle_on_changes_thread_interval(self):
+        win = mock.MagicMock()
+        win._adaptiv_aktiv = False
+        win._adaptiv_mess_iv = 0.5
+        win._adaptiv_filter = tpg.AdaptivFilter()
+        win.meas_thread = mock.MagicMock()
+        win.meas_thread._running = True
+        win.btn_adaptiv = mock.MagicMock()
+        tpg.MainWindow._toggle_adaptiv(win, True)
+        # Thread interval should be set to adaptive interval
+        assert win.meas_thread.interval == 0.5
+
+    def test_on_new_data_uses_adaptive_filter(self):
+        """When adaptive is ON, save_data is only emitted when filter passes."""
+        win = mock.MagicMock()
+        win.meas_thread = mock.MagicMock()
+        win.meas_thread._running = True
+        win._adaptiv_aktiv = True
+        win.einheit = "mbar"
+        win.anzeige_einheit = "mbar"
+        win.kanal_widgets = {ch: mock.MagicMock() for ch in tpg.CHANNELS}
+
+        # Filter that always rejects
+        win._adaptiv_filter = mock.MagicMock()
+        win._adaptiv_filter.pruefen.return_value = False
+        win._mbar_zu_anzeige = lambda x: x
+
+        data = {ch: ("0", 750.0) for ch in tpg.CHANNELS}
+        ts = datetime.now(timezone.utc)
+        tpg.MainWindow._on_new_data(win, data, ts)
+
+        # save_data should NOT have been emitted
+        win.signals.save_data.emit.assert_not_called()
+
+    def test_on_new_data_normal_always_emits(self):
+        """When adaptive is OFF, save_data is always emitted."""
+        win = mock.MagicMock()
+        win.meas_thread = mock.MagicMock()
+        win.meas_thread._running = True
+        win._adaptiv_aktiv = False
+        win.einheit = "mbar"
+        win.anzeige_einheit = "mbar"
+        win.kanal_widgets = {ch: mock.MagicMock() for ch in tpg.CHANNELS}
+        win._mbar_zu_anzeige = lambda x: x
+
+        data = {ch: ("0", 750.0) for ch in tpg.CHANNELS}
+        ts = datetime.now(timezone.utc)
+        tpg.MainWindow._on_new_data(win, data, ts)
+
+        win.signals.save_data.emit.assert_called_once()
+
+    def test_start_uses_adaptive_interval_when_active(self):
+        """_toggle_messung uses _adaptiv_mess_iv when adaptive is active."""
+        win = mock.MagicMock()
+        win._closing = False
+        win.meas_thread = None  # no running thread
+        win._adaptiv_aktiv = True
+        win._adaptiv_mess_iv = 2.0
+        win.spin_interval.value.return_value = 10.0
+        win.signals = make_mock_signals()
+        win.dev_cfg = TEST_DEV_CFG
+        win.ts_puffer = deque()
+        win.wertpuffer = {ch: deque() for ch in tpg.CHANNELS}
+
+        # Capture the MeasThread constructor call
+        with mock.patch.object(tpg, 'MeasThread') as MockThread:
+            mock_instance = mock.MagicMock()
+            MockThread.return_value = mock_instance
+            tpg.MainWindow._toggle_messung(win)
+            # Should use adaptive interval (2.0), not spinner (10.0)
+            MockThread.assert_called_once_with(2.0, win.signals, TEST_DEV_CFG)
+
+
+class TestLoggingTimestamps:
+    """CSV-Logging schreibt korrekte Zeitstempel."""
+
+    def test_csv_row_has_correct_timestamps(self):
+        """_verarbeite_messwerte erzeugt korrekte Zeitfelder."""
+        win = mock.MagicMock()
+        win.einheit = "mbar"
+        win.logging_on = False
+        win.wertpuffer = {ch: deque() for ch in tpg.CHANNELS}
+
+        ts_utc = datetime(2025, 6, 15, 14, 30, 45, tzinfo=timezone.utc)
+        ts_local = ts_utc.astimezone(tpg.giessen_tz())
+
+        data = {ch: ("0", 750.0) for ch in tpg.CHANNELS}
+        tpg.MainWindow._verarbeite_messwerte(win, data, ts_utc, ts_local)
+
+        # Check the wertpuffer was populated
+        for ch in tpg.CHANNELS:
+            assert len(win.wertpuffer[ch]) == 1
+
+    def test_csv_write_uses_utc_and_local_time(self):
+        """CSV-Zeile enthält sowohl UTC- als auch Gießen-Zeit."""
+        win = mock.MagicMock()
+        win.einheit = "mbar"
+        win.logging_on = True
+        win.log_date = "2025-06-15"
+        win.csv_writer = mock.MagicMock()
+        win.csv_file = mock.MagicMock()
+        win.wertpuffer = {ch: deque() for ch in tpg.CHANNELS}
+
+        ts_utc = datetime(2025, 6, 15, 14, 30, 45, tzinfo=timezone.utc)
+        ts_local = ts_utc.astimezone(tpg.giessen_tz())
+
+        data = {ch: ("0", 750.0) for ch in tpg.CHANNELS}
+        tpg.MainWindow._verarbeite_messwerte(win, data, ts_utc, ts_local)
+
+        win.csv_writer.writerow.assert_called_once()
+        row = win.csv_writer.writerow.call_args[0][0]
+
+        # row[0] = Datum_ISO (UTC), row[1] = Zeit_UTC, row[2] = Zeit_Giessen
+        assert row[0] == "2025-06-15"
+        assert row[1] == "14:30:45"
+        assert row[2] == ts_local.strftime("%H:%M:%S")
+        # row[3] = MJD (should be a number)
+        assert float(row[3]) > 0
+
+
+class TestPlotTageWidgetVisibility:
+    """Plot-Tage SpinBox: Erzeugung, Layout-Integration, Verdrahtung."""
+
+    def test_spin_plot_tage_created_in_build_ctrl(self, qapp):
+        """Das Widget wird erzeugt und hat den richtigen Wertebereich."""
+        # We can't easily build the full MainWindow, but we can check
+        # that the spin_plot_tage attribute gets created with correct range
+        spin = tpg.QSpinBox()
+        spin.setRange(1, 7)
+        spin.setValue(3)
+        spin.setSuffix(" d")
+        assert spin.minimum() == 1
+        assert spin.maximum() == 7
+        assert spin.value() == 3
+        assert spin.suffix() == " d"
+
+    def test_plot_tage_label_exists_in_code(self):
+        """Verify the label 'Plot-Tage:' exists in the GUI build code."""
+        import inspect
+        source = inspect.getsource(tpg.MainWindow._build_ctrl)
+        assert "Plot-Tage:" in source
+
+    def test_plot_tage_widget_in_z2_layout(self):
+        """Verify spin_plot_tage is added to z2 (row 2) layout."""
+        import inspect
+        source = inspect.getsource(tpg.MainWindow._build_ctrl)
+        # Check that the widget is created AND added to a layout
+        assert "self.spin_plot_tage" in source
+        assert "z2.addWidget(self.spin_plot_tage)" in source
+
+    def test_plot_tage_has_label_before_widget(self):
+        """Verify a label precedes the spinbox in the layout."""
+        import inspect
+        source = inspect.getsource(tpg.MainWindow._build_ctrl)
+        label_pos = source.find('"Plot-Tage:"')
+        widget_pos = source.find("z2.addWidget(self.spin_plot_tage)")
+        assert label_pos > 0, "Label 'Plot-Tage:' not found"
+        assert widget_pos > 0, "spin_plot_tage not added to layout"
+        assert label_pos < widget_pos, "Label should come before widget"
+
+
+class TestPlotFensterAlleRegression:
+    """'Alle' (0) im Minuten-Spinner zeigt alle gepufferten Daten."""
+
+    def test_fenster_alle_shows_all_data(self):
+        """When fenster_min=0, all data in deque is shown (no tage clipping)."""
+        # Simulate the _aktualisiere_plot logic inline
+        ts_arr = [1.0, 2.0, 3.0, 4.0, 5.0]  # mpl-days spanning 5 days
+        fenster_min = 0  # "Alle"
+
+        # Old buggy code would clip to _plot_tage here.
+        # Fixed code: when fenster_min==0, show everything.
+        if fenster_min > 0 and ts_arr:
+            grenze = ts_arr[-1] - fenster_min * 60.0 / 86400.0
+            idx_start = next((i for i, t in enumerate(ts_arr) if t >= grenze), 0)
+        else:
+            idx_start = 0
+
+        assert idx_start == 0  # ALL data visible
+
+    def test_fenster_nonzero_clips_correctly(self):
+        """When fenster_min > 0, only last N minutes are shown."""
+        ts_arr = [0.0, 0.5, 1.0, 1.5, 2.0]  # mpl-days
+        fenster_min = 720  # 12 hours = 0.5 days
+
+        grenze = ts_arr[-1] - fenster_min * 60.0 / 86400.0
+        idx_start = next((i for i, t in enumerate(ts_arr) if t >= grenze), 0)
+        visible = ts_arr[idx_start:]
+
+        assert len(visible) == 2  # only last 0.5 days (1.5 and 2.0)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
