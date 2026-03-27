@@ -24,6 +24,7 @@ from collections import deque
 
 from device_config import DeviceConfig, validate_config
 from unit_utils import zu_mbar, mbar_zu_anzeige
+from csv_archive import ArchiveCache
 
 
 def ts_print(*args, **kwargs):
@@ -1245,6 +1246,9 @@ class MainWindow(QMainWindow):
         self.ts_puffer  = deque(maxlen=max_punkte)
         self.wertpuffer = {ch: deque(maxlen=max_punkte) for ch in CHANNELS}
 
+        # Archiv-Cache: Vortage aus CSV nachladen
+        self._archive = ArchiveCache(CHANNELS)
+
         self.settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
 
         # Statusbar-Prioritätssystem
@@ -2077,6 +2081,8 @@ class MainWindow(QMainWindow):
         for ch in CHANNELS:
             old_w = list(self.wertpuffer[ch])
             self.wertpuffer[ch] = deque(old_w, maxlen=max_punkte)
+        # Archiv-Cache invalidieren (andere Tage nötig)
+        self._archive.clear()
         self._log(f"Plot-Sichtfenster geändert: {tage} Tag(e)")
 
     def _on_interval_changed(self, v: float):
@@ -2322,32 +2328,52 @@ class MainWindow(QMainWindow):
         ts_arr      = list(self.ts_puffer)
         fenster_min = self.spin_zeitfenster.value()
 
-        # ── Sichtfenster berechnen ────────────────────────────────────────
-        # Minuten-Spinner > 0 → verwende Minuten-Fenster.
-        # Minuten-Spinner == 0 ("Alle") → zeige alles im Deque-Puffer.
-        # Der Deque-Puffer selbst ist durch plot_tage × 86400 begrenzt,
-        # d.h. RAM wächst nie über die eingestellten Tage hinaus.
+        # ── Sichtfenster auf Live-Daten anwenden ─────────────────────────
         if fenster_min > 0 and ts_arr:
             grenze    = ts_arr[-1] - fenster_min * 60.0 / 86400.0
             idx_start = next((i for i, t in enumerate(ts_arr) if t >= grenze), 0)
-            ts_plot   = ts_arr[idx_start:]
+            ts_live   = ts_arr[idx_start:]
         else:
-            ts_plot   = ts_arr
+            ts_live   = ts_arr
             idx_start = 0
 
+        live_werte = {}
         for ch in CHANNELS:
-            w_arr   = list(self.wertpuffer[ch])
-            w_plot  = w_arr[idx_start:]
-            t_valid = [t for t, w in zip(ts_plot, w_plot) if w is not None]
-            w_valid = [self._mbar_zu_anzeige(w) for w in w_plot if w is not None]
+            w_arr = list(self.wertpuffer[ch])
+            live_werte[ch] = w_arr[idx_start:]
+
+        # ── Archiv-Vortage nachladen (nur wenn plot_tage > 1) ────────────
+        ordner = self.edit_pfad.text().strip()
+        heute  = datetime_utc_now().strftime("%Y-%m-%d")
+        live_ts_min = ts_live[0] if ts_live else None
+
+        arch_ts, arch_w = self._archive.get_archive_data(
+            ordner, self._plot_tage, heute, live_ts_min
+        )
+
+        # ── Zusammenführen: Archiv + Live ────────────────────────────────
+        for ch in CHANNELS:
+            a_ts = arch_ts
+            a_w  = arch_w.get(ch, [])
+            l_ts = ts_live
+            l_w  = live_werte[ch]
+
+            # Archiv vor Live anhängen
+            merged_t = a_ts + l_ts
+            merged_w = a_w + l_w
+
+            t_valid = [t for t, w in zip(merged_t, merged_w) if w is not None]
+            w_valid = [self._mbar_zu_anzeige(w) for w in merged_w if w is not None]
             self._mpl_lines[ch].set_xdata(t_valid)
             self._mpl_lines[ch].set_ydata(w_valid)
-            # Statistik → Qt-Label
+            # Statistik → Qt-Label (nur Live-Daten für Aktualität)
             if hasattr(self, '_stats_labels'):
-                if w_valid:
-                    mn  = min(w_valid)
-                    mx  = max(w_valid)
-                    avg = sum(w_valid) / len(w_valid)
+                w_live_valid = [self._mbar_zu_anzeige(w)
+                                for w in l_w if w is not None]
+                if w_live_valid:
+                    mn  = min(w_live_valid)
+                    mx  = max(w_live_valid)
+                    avg = sum(w_live_valid) / len(w_live_valid)
                     u   = self.anzeige_einheit
                     self._stats_labels[ch].setText(
                         f"K{ch}  min {mn:.3G}  max {mx:.3G}  Ø {avg:.3G} {u}"

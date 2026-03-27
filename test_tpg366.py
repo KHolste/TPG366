@@ -1670,5 +1670,166 @@ class TestPlotFensterAlleRegression:
         assert len(visible) == 2  # only last 0.5 days (1.5 and 2.0)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  CSV-Archiv: Nachladen von Vortagen
+# ══════════════════════════════════════════════════════════════════════════════
+
+from csv_archive import load_day_csv, ArchiveCache
+import matplotlib.dates as mdates
+
+
+class TestLoadDayCsv:
+    """load_day_csv: robustes Einlesen einzelner Tages-CSVs."""
+
+    def _write_csv(self, path, lines):
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write("\n".join(lines))
+
+    def test_load_valid_csv(self, tmp_path):
+        p = str(tmp_path / "2025-06-14.csv")
+        self._write_csv(p, [
+            "Datum_ISO,Zeit_UTC,Zeit_Giessen,MJD,K4_mbar,K4_Status,K5_mbar,K5_Status,K6_mbar,K6_Status",
+            "2025-06-14,10:00:00,12:00:00,60480.4167,7.50E+02,OK,1.00E-03,OK,5.00E+01,OK",
+            "2025-06-14,10:00:01,12:00:01,60480.4167,7.51E+02,OK,1.01E-03,OK,5.01E+01,OK",
+        ])
+        ts, w = load_day_csv(p, [4, 5, 6])
+        assert len(ts) == 2
+        assert len(w[4]) == 2
+        assert w[4][0] == pytest.approx(750.0)
+        assert w[5][0] == pytest.approx(0.001)
+
+    def test_missing_file_returns_empty(self, tmp_path):
+        ts, w = load_day_csv(str(tmp_path / "nope.csv"), [4, 5, 6])
+        assert ts == []
+        assert w[4] == []
+
+    def test_empty_file_returns_empty(self, tmp_path):
+        p = str(tmp_path / "empty.csv")
+        self._write_csv(p, [""])
+        ts, w = load_day_csv(p, [4, 5, 6])
+        assert ts == []
+
+    def test_broken_rows_skipped(self, tmp_path):
+        p = str(tmp_path / "broken.csv")
+        self._write_csv(p, [
+            "Datum_ISO,Zeit_UTC,Zeit_Giessen,MJD,K4_mbar,K4_Status",
+            "2025-06-14,10:00:00,12:00:00,60480.4167,7.50E+02,OK",
+            "BROKEN_ROW_NO_COMMAS",
+            "2025-06-14,10:00:02,12:00:02,60480.4167,7.52E+02,OK",
+        ])
+        ts, w = load_day_csv(p, [4])
+        assert len(ts) == 2  # broken row skipped
+
+    def test_nan_inf_values_treated_as_none(self, tmp_path):
+        p = str(tmp_path / "nantest.csv")
+        self._write_csv(p, [
+            "Datum_ISO,Zeit_UTC,Zeit_Giessen,MJD,K4_mbar,K4_Status",
+            "2025-06-14,10:00:00,12:00:00,60480.4167,nan,OK",
+            "2025-06-14,10:00:01,12:00:01,60480.4167,inf,OK",
+            "2025-06-14,10:00:02,12:00:02,60480.4167,1.00E+02,OK",
+        ])
+        ts, w = load_day_csv(p, [4])
+        assert len(ts) == 3
+        assert w[4][0] is None  # nan
+        assert w[4][1] is None  # inf
+        assert w[4][2] == pytest.approx(100.0)
+
+
+class TestArchiveCache:
+    """ArchiveCache: on-demand Nachladen mit Cache und Duplikatvermeidung."""
+
+    def _make_csv(self, ordner, datum, stunden):
+        """Erzeugt eine Tages-CSV mit stündlichen Werten."""
+        lines = [
+            "Datum_ISO,Zeit_UTC,Zeit_Giessen,MJD,K4_mbar,K4_Status,K5_mbar,K5_Status,K6_mbar,K6_Status"
+        ]
+        for h in stunden:
+            lines.append(
+                f"{datum},{h:02d}:00:00,{h:02d}:00:00,60000.0,"
+                f"7.50E+02,OK,1.00E-03,OK,5.00E+01,OK"
+            )
+        pfad = os.path.join(ordner, f"{datum}.csv")
+        with open(pfad, "w", encoding="utf-8", newline="") as f:
+            f.write("\n".join(lines))
+
+    def test_plot_tage_1_returns_empty(self, tmp_path):
+        """Mit plot_tage=1 wird kein Archiv geladen."""
+        cache = ArchiveCache([4, 5, 6])
+        ts, w = cache.get_archive_data(str(tmp_path), 1, "2025-06-15", None)
+        assert ts == []
+
+    def test_plot_tage_2_loads_yesterday(self, tmp_path):
+        """Mit plot_tage=2 wird der Vortag geladen."""
+        od = str(tmp_path)
+        self._make_csv(od, "2025-06-14", [10, 11, 12])
+        cache = ArchiveCache([4, 5, 6])
+        ts, w = cache.get_archive_data(od, 2, "2025-06-15", None)
+        assert len(ts) == 3
+        assert len(w[4]) == 3
+
+    def test_missing_day_no_crash(self, tmp_path):
+        """Fehlende CSV für einen Vortag → kein Absturz."""
+        cache = ArchiveCache([4, 5, 6])
+        ts, w = cache.get_archive_data(str(tmp_path), 3, "2025-06-15", None)
+        assert ts == []
+
+    def test_duplicate_avoidance(self, tmp_path):
+        """Archivdaten die im Live-Puffer liegen werden ausgeschnitten."""
+        od = str(tmp_path)
+        self._make_csv(od, "2025-06-14", list(range(0, 24)))
+        cache = ArchiveCache([4, 5, 6])
+        # live_ts_min = 14.Juni 12:00 UTC (als mpl date number)
+        live_min = mdates.date2num(
+            datetime(2025, 6, 14, 12, 0, 0, tzinfo=timezone.utc)
+        )
+        ts, w = cache.get_archive_data(od, 2, "2025-06-15", live_min)
+        # Nur Daten VOR 12:00 (Stunden 0–11) sollen enthalten sein
+        assert len(ts) == 12
+        assert len(w[4]) == 12
+
+    def test_cache_hit(self, tmp_path):
+        """Zweiter Aufruf nutzt Cache statt nochmal zu lesen."""
+        od = str(tmp_path)
+        self._make_csv(od, "2025-06-14", [10, 11])
+        cache = ArchiveCache([4, 5, 6])
+        ts1, _ = cache.get_archive_data(od, 2, "2025-06-15", None)
+        assert len(ts1) == 2
+        # Datei löschen — Cache sollte trotzdem liefern
+        os.remove(os.path.join(od, "2025-06-14.csv"))
+        ts2, _ = cache.get_archive_data(od, 2, "2025-06-15", None)
+        assert len(ts2) == 2
+
+    def test_cache_cleared_on_different_tage(self, tmp_path):
+        """Cache wird aufgeräumt wenn sich benötigte Tage ändern."""
+        od = str(tmp_path)
+        self._make_csv(od, "2025-06-13", [10])
+        self._make_csv(od, "2025-06-14", [11])
+        cache = ArchiveCache([4, 5, 6])
+        # plot_tage=3 → lade 13. und 14.
+        cache.get_archive_data(od, 3, "2025-06-15", None)
+        assert "2025-06-13" in cache._cache
+        assert "2025-06-14" in cache._cache
+        # plot_tage=2 → nur 14. benötigt; 13. wird aus Cache entfernt
+        cache.get_archive_data(od, 2, "2025-06-15", None)
+        assert "2025-06-13" not in cache._cache
+        assert "2025-06-14" in cache._cache
+
+    def test_empty_ordner_returns_empty(self):
+        """Leerer Ordnerpfad → kein Crash."""
+        cache = ArchiveCache([4, 5, 6])
+        ts, w = cache.get_archive_data("", 3, "2025-06-15", None)
+        assert ts == []
+
+    def test_plot_tage_7_loads_6_days(self, tmp_path):
+        """plot_tage=7 lädt maximal 6 Vortage."""
+        od = str(tmp_path)
+        for i in range(1, 8):
+            d = f"2025-06-{15-i:02d}"
+            self._make_csv(od, d, [12])
+        cache = ArchiveCache([4, 5, 6])
+        ts, w = cache.get_archive_data(od, 7, "2025-06-15", None)
+        assert len(ts) == 6  # 6 Vortage × 1 Datenpunkt
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
