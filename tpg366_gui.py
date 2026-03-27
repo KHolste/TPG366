@@ -22,6 +22,9 @@ import platform
 from datetime import datetime, timezone, timedelta
 from collections import deque
 
+from device_config import DeviceConfig, validate_config
+from unit_utils import zu_mbar, mbar_zu_anzeige
+
 try:
     from colorama import init as colorama_init
     from pyfiglet import figlet_format
@@ -76,6 +79,9 @@ from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavToolbar
 #  KONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Modul-Level-Defaults (werden von MainWindow beim Start aus Config überschrieben).
+# Nur noch für AboutDialog und Legacy-Kompatibilität genutzt.
+# Die tatsächlichen Verbindungsparameter stecken in DeviceConfig-Instanzen.
 HOST        = "192.168.1.71"
 PORT        = 8000
 TIMEOUT     = 3
@@ -98,10 +104,9 @@ EINHEITEN = {
     "3": "Micron", "4": "hPa", "5": "V",
 }
 
-HPAMBAR = {
-    "mbar": 1.0, "hPa": 1.0, "Pa": 0.01,
-    "Torr": 1.33322, "Micron": 0.00133322, "V": None,
-}
+# Legacy-Alias: wird noch von parse_druck-Umfeld referenziert.
+# Kanonische Quelle ist jetzt unit_utils.GERAET_ZU_MBAR.
+from unit_utils import GERAET_ZU_MBAR as HPAMBAR
 
 PLOT_STYLES = ["Linie", "Scatter", "Linie + Scatter"]
 
@@ -140,6 +145,17 @@ CONFIG_DEFAULTS = {
 }
 
 
+def _deep_merge(defaults: dict, override: dict) -> dict:
+    """Rekursiver Merge: Override-Werte überschreiben Defaults, fehlende bleiben."""
+    result = dict(defaults)
+    for k, v in override.items():
+        if k in result and isinstance(result[k], dict) and isinstance(v, dict):
+            result[k] = _deep_merge(result[k], v)
+        else:
+            result[k] = v
+    return result
+
+
 def config_laden() -> dict:
     """Lädt tpg366_config.json; fehlende Keys werden mit Defaults ergänzt."""
     cfg = dict(CONFIG_DEFAULTS)
@@ -147,7 +163,7 @@ def config_laden() -> dict:
         try:
             with open(CONFIG_FILE, encoding="utf-8") as f:
                 gespeichert = _json.load(f)
-            cfg.update(gespeichert)
+            cfg = _deep_merge(cfg, gespeichert)
         except Exception as e:
             print(f"Config-Ladefehler ({CONFIG_FILE}): {e}")
     return cfg
@@ -252,6 +268,19 @@ ACK = b'\x06'
 ENQ = b'\x05'
 
 
+def _recv_until(sock, terminator=b'\r\n', max_bytes=256):
+    """Liest vom Socket bis Terminator oder max_bytes erreicht."""
+    buf = b''
+    while len(buf) < max_bytes:
+        chunk = sock.recv(1)
+        if not chunk:
+            break
+        buf += chunk
+        if buf.endswith(terminator):
+            break
+    return buf
+
+
 def pv_command(sock, befehl: str):
     sock.sendall((befehl + "\r\n").encode("ascii"))
     time.sleep(0.08)
@@ -260,7 +289,7 @@ def pv_command(sock, befehl: str):
         return False, f"NAK: {repr(r)}"
     sock.sendall(ENQ)
     time.sleep(0.08)
-    return True, sock.recv(256).decode("ascii").strip()
+    return True, _recv_until(sock).decode("ascii").strip()
 
 
 def parse_druck(antwort: str):
@@ -268,17 +297,16 @@ def parse_druck(antwort: str):
     if len(teile) == 2:
         code = teile[0].strip()
         try:
-            return code, float(teile[1].strip())
+            v = float(teile[1].strip())
+            if math.isfinite(v):
+                return code, v
+            return code, None  # NaN/Inf → ungültig
         except ValueError:
             return code, None
     return "?", None
 
 
-def zu_mbar(wert, einheit: str):
-    if wert is None:
-        return None
-    f = HPAMBAR.get(einheit)
-    return None if f is None else wert * f
+# zu_mbar ist jetzt aus unit_utils importiert
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -297,14 +325,17 @@ RECONNECT_INTERVAL = 5   # Sekunden zwischen Reconnect-Versuchen
 
 
 class MeasThread(threading.Thread):
-    def __init__(self, interval_s: float, signals: MeasSignals):
+    def __init__(self, interval_s: float, signals: MeasSignals,
+                 dev_cfg: DeviceConfig):
         super().__init__(daemon=True)
         self._interval = interval_s
         self._interval_lock = threading.Lock()
         self.signals  = signals
+        self.dev_cfg  = dev_cfg   # Verbindungsparameter (unveränderlich)
         self._running = False
         self._sock    = None
-        self._lock    = threading.Lock()
+        self._lock    = threading.Lock()  # schützt Socket-Zugriff (Mess + Sensor)
+        self._stop_event = threading.Event()
 
     @property
     def interval(self) -> float:
@@ -318,36 +349,42 @@ class MeasThread(threading.Thread):
 
     def _connect(self) -> bool:
         """Baut TCP-Verbindung auf. Gibt True bei Erfolg zurück."""
+        cfg = self.dev_cfg
         try:
-            self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self._sock.settimeout(TIMEOUT)
-            self._sock.connect((HOST, PORT))
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(cfg.timeout)
+            s.connect((cfg.host, cfg.port))
+            with self._lock:
+                self._sock = s
             return True
         except Exception as e:
             self.signals.error.emit(f"Verbindung fehlgeschlagen: {e}")
-            if self._sock:
-                try: self._sock.close()
-                except Exception: pass
+            try: s.close()
+            except Exception: pass
+            with self._lock:
                 self._sock = None
             return False
 
     def run(self):
-        self._running  = True
-        versuch        = 0
+        # _running wird vom Aufrufer VOR start() gesetzt, um Race mit stop() zu vermeiden
+        versuch = 0
 
         while self._running:
             # ── Verbinden (mit Reconnect-Schleife) ──────────────────────────
             if not self._connect():
                 versuch += 1
                 self.signals.reconnecting.emit(versuch)
-                for _ in range(RECONNECT_INTERVAL * 10):
-                    if not self._running:
-                        return
-                    time.sleep(0.1)
+                if self._stop_event.wait(RECONNECT_INTERVAL):
+                    return  # stop() wurde aufgerufen
                 continue
 
             versuch = 0   # Verbindung erfolgreich → Zähler zurück
-            ok, wert = pv_command(self._sock, "UNI")
+            with self._lock:
+                try:
+                    ok, wert = pv_command(self._sock, "UNI")
+                except OSError:
+                    ok = False
+                    wert = ""
             self.signals.connected.emit(
                 EINHEITEN.get(wert.strip(), "?") if ok else "?"
             )
@@ -358,57 +395,71 @@ class MeasThread(threading.Thread):
                 ts_utc = datetime_utc_now()
                 data   = {}
                 conn_lost = False
-                for ch in CHANNELS:
-                    try:
-                        ok, ans = pv_command(self._sock, f"PR{ch}")
-                        data[ch] = parse_druck(ans) if ok else ("?", None)
-                    except OSError:
+                with self._lock:
+                    for ch in self.dev_cfg.channels:
                         if not self._running:
                             return
-                        # Socket-Fehler → Verbindung verloren
-                        conn_lost = True
-                        break
-                    except Exception as e:
-                        if not self._running:
-                            return
-                        self.signals.error.emit(f"Lesefehler K{ch}: {e}")
-                        data[ch] = ("?", None)
+                        try:
+                            ok, ans = pv_command(self._sock, f"PR{ch}")
+                            data[ch] = parse_druck(ans) if ok else ("?", None)
+                        except OSError:
+                            if not self._running:
+                                return
+                            conn_lost = True
+                            break
+                        except Exception as e:
+                            if not self._running:
+                                return
+                            self.signals.error.emit(f"Lesefehler K{ch}: {e}")
+                            data[ch] = ("?", None)
 
                 if conn_lost:
                     self.signals.error.emit(
                         f"Verbindung verloren — Reconnect in {RECONNECT_INTERVAL} s"
                     )
-                    try: self._sock.close()
-                    except Exception: pass
-                    self._sock = None
+                    with self._lock:
+                        if self._sock:
+                            try: self._sock.close()
+                            except Exception: pass
+                            self._sock = None
                     break   # innere Schleife verlassen → äußere Schleife reconnectet
 
                 if self._running:
                     self.signals.new_data.emit(data, ts_utc)
-                time.sleep(max(0, self.interval - (time.time() - t0)))
+                wait = max(0, self.interval - (time.time() - t0))
+                if wait > 0 and self._stop_event.wait(wait):
+                    return  # stop() während sleep → sofort beenden
 
     def stop(self):
         self._running = False
-        # Kurz warten damit der laufende Messzyklus sauber abschließen kann
-        time.sleep(0.05)
-        if self._sock:
+        self._stop_event.set()
+        # Socket schließen OHNE Lock → entblockt recv() sofort, kein GUI-Freeze
+        # socket.close() von anderem Thread erzeugt OSError im blockierenden recv()
+        sock = self._sock
+        if sock:
             try:
-                self._sock.close()
+                sock.close()
             except Exception:
                 pass
+        # Kurzer Join – nach Socket-Close beendet der Thread sich schnell
+        if self._started.is_set():
+            self.join(timeout=1.0)
 
     def set_sensor(self, channel: int, on: bool):
-        if not self._sock:
-            return
         with self._lock:
-            ok, wert = pv_command(self._sock, "SEN")
-            if not ok:
+            if not self._sock:
                 return
-            stati = [s.strip() for s in wert.split(",")]
-            if len(stati) < 6:
-                return
-            stati[channel - 1] = "1" if on else "0"
-            pv_command(self._sock, "SEN=" + ",".join(stati))
+            try:
+                ok, wert = pv_command(self._sock, "SEN")
+                if not ok:
+                    return
+                stati = [s.strip() for s in wert.split(",")]
+                if len(stati) < 6:
+                    return
+                stati[channel - 1] = "1" if on else "0"
+                pv_command(self._sock, "SEN=" + ",".join(stati))
+            except OSError:
+                pass  # Verbindung verloren, Messschleife handled Reconnect
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -647,19 +698,22 @@ class KanalWidget(QGroupBox):
             self._alarm_style() if self._blink_status else self._normal_style()
         )
 
-    def update_display(self, status_code: str, wert_anzeige, einheit: str = "mbar"):
+    def update_display(self, status_code: str, wert_anzeige, einheit: str = "mbar",
+                       wert_mbar=None):
         st = SENSOR_STATUS.get(status_code, status_code)
         if status_code == "0" and wert_anzeige is not None:
             self.lbl_wert.setText(f"{wert_anzeige:.3E}")
             self.lbl_einheit.setText(einheit)
             self.lbl_status.setText(st)
-            if self.alarm_grenze is not None and wert_anzeige > self.alarm_grenze:
+            # alarm_grenze ist immer in mbar → Vergleich in mbar
+            alarm_wert = wert_mbar if wert_mbar is not None else wert_anzeige
+            if self.alarm_grenze is not None and alarm_wert > self.alarm_grenze:
                 self.lbl_alarm.setText(f"⚠ ALARM > {self.alarm_grenze:.2E}")
                 self.lbl_wert.setStyleSheet("color: #FF4444;")
                 if not self._alarm_aktiv:
                     self._alarm_aktiv = True
                     self._blink_timer.start()
-                    self.alarm_ausgeloest.emit(self.channel, wert_anzeige)
+                    self.alarm_ausgeloest.emit(self.channel, alarm_wert)
             else:
                 self.lbl_alarm.setText("")
                 self.lbl_wert.setStyleSheet(f"color: {self.farbe};")
@@ -1133,13 +1187,16 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("TPG 366 MaxiGauge – Datenerfassung  v3")
         self.resize(1280, 900)
 
-        # Konfiguration laden
+        # Konfiguration laden + defensiv validieren
         self._cfg = config_laden()
+        self.dev_cfg = validate_config(self._cfg)
+
+        # Modul-Globals aktualisieren (Legacy: AboutDialog, _cfg_snapshot, UI-Strings)
         global HOST, PORT, TIMEOUT, CHANNELS
-        HOST     = self._cfg.get("host",     HOST)
-        PORT     = int(self._cfg.get("port", PORT))
-        TIMEOUT  = int(self._cfg.get("timeout", TIMEOUT))
-        CHANNELS = self._cfg.get("channels", CHANNELS)
+        HOST     = self.dev_cfg.host
+        PORT     = self.dev_cfg.port
+        TIMEOUT  = self.dev_cfg.timeout
+        CHANNELS = self.dev_cfg.channels
 
         self.einheit         = "hPa"
         self.anzeige_einheit = "mbar"
@@ -1872,8 +1929,11 @@ class MainWindow(QMainWindow):
 
     def _apply_cfg_to_ui(self):
         """Überträgt geladene Config-Werte in die UI-Widgets."""
-        # Intervall
-        iv = self._cfg.get("interval", 1.0)
+        # Intervall (defensiv: ungültige Typen → Default)
+        try:
+            iv = float(self._cfg.get("interval", 1.0))
+        except (ValueError, TypeError):
+            iv = 1.0
         self.spin_interval.blockSignals(True)
         self.spin_interval.setValue(iv)
         self.spin_interval.blockSignals(False)
@@ -1893,13 +1953,20 @@ class MainWindow(QMainWindow):
         if folder:
             self.edit_pfad.setText(folder)
 
-        # Alarmgrenzen
+        # Alarmgrenzen (defensiv: alarm-Config könnte None oder kein Dict sein)
         alarm_cfg = self._cfg.get("alarm", {})
+        if not isinstance(alarm_cfg, dict):
+            alarm_cfg = {}
         for ch in CHANNELS:
             a = alarm_cfg.get(str(ch), {})
+            if not isinstance(a, dict):
+                continue
             if a.get("aktiv", False):
                 self.alarm_checks[ch].setChecked(True)
-                self.alarm_spins[ch].setValue(a.get("grenze", 1000.0))
+                try:
+                    self.alarm_spins[ch].setValue(float(a.get("grenze", 1000.0)))
+                except (ValueError, TypeError):
+                    pass
 
         # Auto-Start
         self.chk_autostart.setChecked(self._cfg.get("auto_start", False))
@@ -1942,6 +2009,8 @@ class MainWindow(QMainWindow):
         }
 
     def _on_reconnecting(self, versuch: int):
+        if not self.meas_thread or not self.meas_thread._running:
+            return
         msg = (
             f"⚠ Verbindung verloren — Reconnect-Versuch {versuch} "
             f"in {RECONNECT_INTERVAL} s …"
@@ -1951,20 +2020,9 @@ class MainWindow(QMainWindow):
 
     # ── Einheitenumrechnung ────────────────────────────────────────────────────
 
-    # Umrechnungsfaktoren mbar → Zieleinheit
-    _MBAR_ZU = {
-        "mbar":  1.0,
-        "hPa":   1.0,
-        "Pa":    100.0,
-        "Torr":  0.750062,
-        "Micron": 750.062,
-    }
-
     def _mbar_zu_anzeige(self, wert_mbar):
         """Rechnet einen mbar-Wert in die gewählte Anzeigeeinheit um."""
-        if wert_mbar is None:
-            return None
-        return wert_mbar * self._MBAR_ZU.get(self.anzeige_einheit, 1.0)
+        return mbar_zu_anzeige(wert_mbar, self.anzeige_einheit)
 
     def _on_interval_changed(self, v: float):
         self._log(f"Messintervall geändert: {v} s")
@@ -2095,6 +2153,8 @@ class MainWindow(QMainWindow):
     # ── Slots: Messung ─────────────────────────────────────────────────────────
 
     def _toggle_messung(self):
+        if getattr(self, '_closing', False):
+            return
         if self.meas_thread and self.meas_thread._running:
             self.meas_thread.stop()
             self.meas_thread = None
@@ -2104,18 +2164,26 @@ class MainWindow(QMainWindow):
             self._log("Messung gestoppt.")
             self._status("Messung gestoppt.", prio=0)
         else:
+            # Alten Thread sicherheitshalber aufräumen
+            if self.meas_thread is not None:
+                self.meas_thread.stop()
+                self.meas_thread = None
             self.ts_puffer.clear()
             for ch in CHANNELS:
                 self.wertpuffer[ch].clear()
-            self.meas_thread = MeasThread(self.spin_interval.value(), self.signals)
+            iv = self._adaptiv_mess_iv if self._adaptiv_aktiv else self.spin_interval.value()
+            self.meas_thread = MeasThread(iv, self.signals, self.dev_cfg)
+            self.meas_thread._running = True  # Vor start() setzen → Race mit stop() vermeiden
             self.meas_thread.start()
             self._style_btn(self.btn_start, "red")
             self.btn_start.setText("■  Messung stoppen")
-            msg = f"Messung gestartet  (Intervall {self.spin_interval.value()} s)"
+            msg = f"Messung gestartet  (Intervall {iv} s)"
             self._log(msg)
             self._status(msg, prio=0)
 
     def _on_connected(self, einheit: str):
+        if not self.meas_thread or not self.meas_thread._running:
+            return
         self.einheit = einheit
         msg = f"Verbunden mit {HOST}:{PORT}  |  Einheit: {einheit}"
         self._log(msg)
@@ -2123,6 +2191,8 @@ class MainWindow(QMainWindow):
 
     def _on_new_data(self, data: dict, ts_utc: datetime):
         """Empfängt jeden Rohwert (1s-Takt). Entscheidet ob gespeichert wird."""
+        if not self.meas_thread or not self.meas_thread._running:
+            return  # Stale signal nach Stop ignorieren
         ts_local = ts_utc.astimezone(giessen_tz())
         ts_mpl   = mdates.date2num(ts_utc)
 
@@ -2131,7 +2201,9 @@ class MainWindow(QMainWindow):
             code, wert_gerät = data.get(ch, ("?", None))
             wert_mbar   = zu_mbar(wert_gerät, self.einheit) if code == "0" else None
             wert_anzeige = self._mbar_zu_anzeige(wert_mbar)
-            self.kanal_widgets[ch].update_display(code, wert_anzeige, self.anzeige_einheit)
+            self.kanal_widgets[ch].update_display(
+                code, wert_anzeige, self.anzeige_einheit, wert_mbar=wert_mbar
+            )
 
         if self._adaptiv_aktiv:
             # Adaptiv: nur speichern wenn Filter durchlässt
@@ -2149,6 +2221,8 @@ class MainWindow(QMainWindow):
 
     def _on_save_data(self, data: dict, ts_utc: datetime):
         """Speichert gefilterte Werte in Puffer, CSV und Plot."""
+        if not self.meas_thread or not self.meas_thread._running:
+            return  # Stale signal nach Stop ignorieren
         ts_local = ts_utc.astimezone(giessen_tz())
         ts_mpl   = mdates.date2num(ts_utc)
         self.ts_puffer.append(ts_mpl)
@@ -2181,8 +2255,12 @@ class MainWindow(QMainWindow):
             row_csv.append(SENSOR_STATUS.get(code, code))
 
         if self.logging_on and self.csv_writer:
-            self.csv_writer.writerow(row_csv)
-            self.csv_file.flush()
+            try:
+                self.csv_writer.writerow(row_csv)
+                self.csv_file.flush()
+            except OSError as e:
+                self._log(f"⚠ CSV-Schreibfehler: {e}")
+                self._stop_logging()
 
     def _aktualisiere_plot(self):
         """Linien, Statistik und Achsen neu zeichnen."""
@@ -2226,6 +2304,8 @@ class MainWindow(QMainWindow):
         self.canvas.draw_idle()
 
     def _on_error(self, msg: str):
+        if not self.meas_thread or not self.meas_thread._running:
+            return
         self._log(f"⚠ {msg}")
         self._status(f"⚠  {msg}", prio=2)
 
@@ -2241,22 +2321,26 @@ class MainWindow(QMainWindow):
         self._log(msg)
         self._status(msg, prio=2, dauer_ms=15000)
         if self.logging_on and self.csv_writer:
-            mjd = to_mjd(ts_utc)
-            alarm_row = [
-                ts_utc.strftime("%Y-%m-%d"),
-                ts_utc.strftime("%H:%M:%S"),
-                ts_local.strftime("%H:%M:%S"),
-                f"{mjd:.6f}",
-            ]
-            for ch in CHANNELS:
-                if ch == channel:
-                    alarm_row.append(f"{wert:.6E}")
-                    alarm_row.append("ALARM")
-                else:
-                    alarm_row.append("")
-                    alarm_row.append("")
-            self.csv_writer.writerow(alarm_row)
-            self.csv_file.flush()
+            try:
+                mjd = to_mjd(ts_utc)
+                alarm_row = [
+                    ts_utc.strftime("%Y-%m-%d"),
+                    ts_utc.strftime("%H:%M:%S"),
+                    ts_local.strftime("%H:%M:%S"),
+                    f"{mjd:.6f}",
+                ]
+                for ch in CHANNELS:
+                    if ch == channel:
+                        alarm_row.append(f"{wert:.6E}")
+                        alarm_row.append("ALARM")
+                    else:
+                        alarm_row.append("")
+                        alarm_row.append("")
+                self.csv_writer.writerow(alarm_row)
+                self.csv_file.flush()
+            except OSError as e:
+                self._log(f"⚠ CSV-Schreibfehler (Alarm): {e}")
+                self._stop_logging()
 
     # ── Plot-Stil / Skala ──────────────────────────────────────────────────────
 
@@ -2335,6 +2419,8 @@ class MainWindow(QMainWindow):
     # ── Logging ────────────────────────────────────────────────────────────────
 
     def _toggle_logging(self, checked: bool):
+        if getattr(self, '_closing', False):
+            return
         if checked:
             self._start_logging(datetime_utc_now())
         else:
@@ -2342,17 +2428,51 @@ class MainWindow(QMainWindow):
 
     def _start_logging(self, ts_utc: datetime):
         ordner = self.edit_pfad.text().strip()
-        os.makedirs(ordner, exist_ok=True)
+        if not ordner:
+            self._log("⚠ Logging-Pfad ist leer – bitte Ordner wählen.")
+            self._status("⚠ Kein Logging-Ordner gewählt.", prio=1)
+            self.btn_log.setChecked(False)
+            self._style_btn(self.btn_log, "red")
+            return
+        try:
+            os.makedirs(ordner, exist_ok=True)
+        except OSError as e:
+            self._log(f"⚠ Logging-Ordner konnte nicht erstellt werden: {e}")
+            self._status(f"⚠ Logging-Ordner ungültig: {e}", prio=2)
+            self.btn_log.setChecked(False)
+            self._style_btn(self.btn_log, "red")
+            return
         self.log_date = ts_utc.strftime("%Y-%m-%d")
         pfad  = os.path.join(ordner, f"{self.log_date}.csv")
         neu   = not os.path.exists(pfad)
-        self.csv_file   = open(pfad, "a", newline="", encoding="utf-8")
+        try:
+            self.csv_file   = open(pfad, "a", newline="", encoding="utf-8")
+        except OSError as e:
+            self._log(f"⚠ CSV-Datei konnte nicht geöffnet werden: {e}")
+            self._status(f"⚠ CSV-Fehler: {e}", prio=2)
+            self.btn_log.setChecked(False)
+            self._style_btn(self.btn_log, "red")
+            return
         self.csv_writer = csv.writer(self.csv_file, delimiter=",")
         if neu:
             header = ["Datum_ISO", "Zeit_UTC", "Zeit_Giessen", "MJD"]
             for ch in CHANNELS:
                 header += [f"K{ch}_mbar", f"K{ch}_Status"]
-            self.csv_writer.writerow(header)
+            try:
+                self.csv_writer.writerow(header)
+                self.csv_file.flush()
+            except OSError as e:
+                self._log(f"⚠ CSV-Header konnte nicht geschrieben werden: {e}")
+                self._status(f"⚠ CSV-Fehler: {e}", prio=2)
+                try:
+                    self.csv_file.close()
+                except Exception:
+                    pass
+                self.csv_file = None
+                self.csv_writer = None
+                self.btn_log.setChecked(False)
+                self._style_btn(self.btn_log, "red")
+                return
         self.logging_on = True
         self._style_btn(self.btn_log, "green")
         aktion = "Neue Datei" if neu else "Weiterschreiben"
@@ -2361,14 +2481,19 @@ class MainWindow(QMainWindow):
         self._status(msg, prio=0)
 
     def _stop_logging(self):
+        was_on = self.logging_on
         self.logging_on = False
         if self.csv_file:
-            self.csv_file.close()
+            try:
+                self.csv_file.close()
+            except Exception:
+                pass
             self.csv_file   = None
             self.csv_writer = None
         self.btn_log.setChecked(False)
         self._style_btn(self.btn_log, "red")
-        self._log("Logging gestoppt.")
+        if was_on:
+            self._log("Logging gestoppt.")
 
     def _browse_pfad(self):
         pfad = QFileDialog.getExistingDirectory(self, "Speicherordner wählen")
@@ -2379,6 +2504,8 @@ class MainWindow(QMainWindow):
     # ── Sensor / Alarm ────────────────────────────────────────────────────────
 
     def _toggle_sensor(self, channel: int, on: bool):
+        if getattr(self, '_closing', False):
+            return
         if self.meas_thread and self.meas_thread._running:
             threading.Thread(
                 target=self.meas_thread.set_sensor,
@@ -2412,15 +2539,68 @@ class MainWindow(QMainWindow):
     # ── Close ─────────────────────────────────────────────────────────────────
 
     def closeEvent(self, event):
-        if self.meas_thread:
-            self.meas_thread.stop()
-        self._stop_logging()
-        if self._vgl_win:
-            self._vgl_win.close()
-        config_speichern(self._cfg_snapshot())
-        self.settings.setValue("window_geometry", self.saveGeometry())
-        plt.close(self.fig)
-        self.settings.sync()
+        # Reentrancy-Guard: closeEvent kann durch stop() + Event-Processing
+        # theoretisch doppelt aufgerufen werden
+        if getattr(self, '_closing', False):
+            event.accept()
+            return
+        self._closing = True
+
+        # Timer stoppen (verhindert Callbacks auf halbtoten Widgets)
+        try:
+            self._clock_timer.stop()
+            self._sb_timer.stop()
+            for kw in self.kanal_widgets.values():
+                kw._blink_timer.stop()
+        except Exception:
+            pass
+
+        # Messung stoppen
+        try:
+            if self.meas_thread:
+                self.meas_thread.stop()
+                self.meas_thread = None
+        except Exception:
+            self.meas_thread = None
+
+        # Logging stoppen
+        try:
+            self._stop_logging()
+        except Exception:
+            # Datei notfalls direkt schließen
+            if self.csv_file:
+                try:
+                    self.csv_file.close()
+                except Exception:
+                    pass
+                self.csv_file = None
+                self.csv_writer = None
+            self.logging_on = False
+
+        # Vergleichsfenster schließen
+        try:
+            if self._vgl_win:
+                self._vgl_win.close()
+        except Exception:
+            pass
+
+        # Konfiguration speichern
+        try:
+            config_speichern(self._cfg_snapshot())
+        except Exception:
+            pass
+
+        # Fenstergeometrie speichern + Plot freigeben
+        try:
+            self.settings.setValue("window_geometry", self.saveGeometry())
+            self.settings.sync()
+        except Exception:
+            pass
+        try:
+            plt.close(self.fig)
+        except Exception:
+            pass
+
         event.accept()
 
 

@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pip install -U pip)",
+      "Bash(python -m pip install pytest)",
+      "Bash(python -m pip install pyqt6)",
+      "Bash(python -m pytest test_tpg366.py -v)",
+      "Bash(python -m pytest test_tpg366.py --tb=short)",
+      "Bash(python -m pytest test_tpg366.py -q)",
+      "Bash(timeout 30 python -m pytest test_tpg366.py -v --timeout=10)",
+      "Bash(python -m pytest test_tpg366.py -k \"Alarm\" -v --tb=long)",
+      "Bash(python -c \"import tpg366_gui; print\\(''OK''\\)\")",
+      "Bash(python -c \"import tpg366_gui as tpg; print\\(tpg.zu_mbar\\(100.0, ''mbar''\\)\\)\")",
+      "Bash(python -m pytest test_tpg366.py -q --tb=line)",
+      "Bash(python -m pytest test_tpg366.py -q --tb=short)",
+      "Bash(python -m pytest test_tpg366.py -v --tb=short)"
+    ]
+  }
+}
